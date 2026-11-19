@@ -1,0 +1,586 @@
+/*
+- =========================================================
+- Air Mouse - XIAO ESP32C6 (UPDATED & OPTIMIZED v4.1)
+- Features: 
+-  - Android & Windows BLE Battery Fix (2s GATT Handshake Delay)
+-  - Button 4 Long Press: Gyro Air Scroll | Short Press: LED OFF
+-  - Low-Battery Red Alert at 15% (16x ADC Averaging)
+-  - Sub-Pixel Accumulation, Auto-Calibration, Click-Shake Freeze
+- =========================================================
+ */
+#include <Wire.h>
+#include <MPU6050_tockn.h>
+#include <HijelHID_BLEMouse.h>
+#include <Adafruit_NeoPixel.h>
+
+// Renamed to "Air Mouse v4" so Android bypasses the old GATT cache
+HijelBLEMouse mouse(
+  "Air Mouse v4",
+  "COMET",
+  100,
+  5,
+  true
+);
+
+// MPU6050
+MPU6050 mpu6050(Wire);
+
+// XIAO ESP32C6 I2C Pins
+#define SDA_PIN D4  // GPIO 22
+#define SCL_PIN D5  // GPIO 23
+
+// FOUR PUSH BUTTONS
+#define BUTTON1_PIN D1  // Left Click & Drag
+#define BUTTON2_PIN D3  // Right Click / Middle Click (Long Press)
+#define BUTTON3_PIN D6  // LED ON Button
+#define BUTTON4_PIN D7  // Short Press: LED OFF | Long Press (Hold): Gyro Air Scroll
+
+// BATTERY PIN
+#define BATT_PIN A0     // Battery voltage monitoring pin
+
+// WS2812B LED STRIP PINS & SETTINGS
+#define LED_PIN D2      // GPIO 2
+#define NUM_LEDS 8
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// MOUSE & SCROLL SETTINGS
+float smoothing         = 0.88;
+float baseSensitivity   = 0.08; // Cursor movement has been slowed down
+float scrollSensitivity = 0.04; // Air scroll speed has already been slowed down
+int deadzone            = 2;
+bool ledsEnabled        = true; // LED State Control
+
+// SUB-PIXEL & SCROLL ACCUMULATION VARIABLES
+float remX       = 0.0;
+float remY       = 0.0;
+float scrollAccY = 0.0;
+bool isScrolling = false;       // Activated when holding Button 4
+
+// CLICK-SHAKE COMPENSATION SETTINGS
+unsigned long clickFreezeTime = 0;
+const unsigned long clickFreezeDuration = 70; // Freeze cursor for 70ms while clicking
+
+// BACKGROUND AUTO-CALIBRATION SETTINGS
+unsigned long stillStartTime = 0;
+const unsigned long autoCalibDelay = 3000;    // Auto-calibration when stationary for 3 seconds
+const float stillThreshold = 1.2;             // Threshold to check stillness (deg/s)
+
+// AUTO-SLEEP SETTINGS (2 minutes / 120000 ms)
+unsigned long lastActivityTime = 0;
+const unsigned long sleepTimeout = 120000; 
+bool isSleeping = false;
+
+// BATTERY CHECK & 15% LOW BATTERY ALERT SETTINGS
+unsigned long lastBatteryCheckTime = 0;
+const unsigned long batteryCheckInterval = 20000; // Check every 20 seconds
+const int lowBatteryThreshold = 15;               // Red Alert when 15% or lower
+bool lowBattery = false;
+unsigned long lastLowBattBlinkTime = 0;
+bool lowBattBlinkState = false;
+int lastSentBatteryPercent = -1;                  // For Android Force Notification
+
+// BUTTON TIMINGS & STATES
+unsigned long pressStart2 = 0, pressStart3 = 0, pressStart4 = 0;
+bool buttonHeld1 = false, buttonHeld2 = false, buttonHeld3 = false, buttonHeld4 = false;
+
+// Button 1 (Left Click & Drag) Debounce Variables
+bool lastButton1Reading = HIGH;
+bool debouncedButton1State = HIGH;
+unsigned long lastDebounceTime1 = 0;
+
+const unsigned long debounceDelay       = 30;  // To prevent bounce (30ms)
+const unsigned long longPressThreshold  = 500; // For Button 2 middle click (500ms)
+const unsigned long clickThreshold      = 500; // Button 2 right click (30ms to 500ms)
+const unsigned long scrollHoldThreshold = 250; // Start Air Scroll when Button 4 is held for 250ms
+
+// GYRO
+float gyroBiasZ = 0;
+float gyroBiasY = 0;
+float fX = 0;
+float fY = 0;
+
+// TIMING
+unsigned long lastMoveTime = 0;
+const unsigned long moveInterval = 8; // ~125Hz
+
+// RAINBOW ANIMATION TIMING
+unsigned long lastRainbowTime = 0;
+const unsigned long rainbowInterval = 20;
+uint16_t rainbowHue = 0;
+
+// =====================================================
+// HELPER FUNCTION: SET ALL LEDS TO A SPECIFIC COLOR
+// =====================================================
+void setAllPixelsColor(uint8_t r, uint8_t g, uint8_t b) {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, strip.Color(r, g, b));
+  }
+  strip.show();
+}
+
+void setAllPixelsBlue() {
+  setAllPixelsColor(0, 0, 255); // Blue color
+}
+
+// =====================================================
+// CALIBRATE GYRO (INITIAL FAST CALIBRATION)
+// =====================================================
+void calibrateGyro() {
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("Calibrating gyro...");
+  Serial.println("Keep Air Mouse completely still!");
+  Serial.println("========================================");
+
+  float sumZ = 0;
+  float sumY = 0;
+  const int samples = 500;
+
+  for (int i = 0; i < samples; i++) {
+    mpu6050.update();
+    sumZ += mpu6050.getGyroZ();
+    sumY += mpu6050.getGyroY();
+    delay(3);
+  }
+
+  gyroBiasZ = sumZ / samples;
+  gyroBiasY = sumY / samples;
+
+  Serial.println("Gyro calibration complete");
+  Serial.print("Bias Z: ");
+  Serial.println(gyroBiasZ, 2);
+  Serial.print("Bias Y: ");
+  Serial.println(gyroBiasY, 2);
+  Serial.println();
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("        Air Mouse - ESP32-C6");
+  Serial.println("========================================");
+
+  // I2C Setup
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  delay(100);
+
+  // MPU6050 Setup
+  Serial.println("Initializing MPU6050...");
+  mpu6050.begin();
+  Serial.println("MPU6050 OK");
+
+  // Buttons Setup
+  pinMode(BUTTON1_PIN, INPUT_PULLUP);
+  pinMode(BUTTON2_PIN, INPUT_PULLUP);
+  pinMode(BUTTON3_PIN, INPUT_PULLUP);
+  pinMode(BUTTON4_PIN, INPUT_PULLUP);
+
+  // Battery Pin Setup with ESP32-C6 ADC Attenuation
+  pinMode(BATT_PIN, INPUT);
+  analogSetAttenuation(ADC_11db); // 0-3.3V range
+
+  // WS2812B LED Strip Setup
+  strip.begin();
+  strip.setBrightness(60);  
+  setAllPixelsBlue();  
+
+  // Single Gyro Calibration
+  delay(300);
+  calibrateGyro();
+
+  // BLE HID Setup
+  Serial.println("Starting BLE HID Mouse...");
+  mouse.setUpdateRate(HIDRate::Hz125);
+  mouse.setBatteryLevel(100);
+  mouse.setLogLevel(HIDLogLevel::Normal);
+  mouse.begin();
+
+  lastActivityTime = millis();
+  Serial.println("BLE mouse started");
+  Serial.println("Waiting for connection...");
+  Serial.println("========================================");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+  mpu6050.update();
+  unsigned long now = millis();
+
+  static bool previousPaired = false;
+  bool paired = mouse.isPaired();
+
+  // ===================================================
+  // CONNECTION CHECK (Android 2-Second GATT Delay Fix)
+  // ===================================================
+  if (paired != previousPaired) {
+    if (paired) {
+      Serial.println();
+      Serial.println("********************************");
+      Serial.println("BLE MOUSE CONNECTED!");
+      Serial.println("********************************");
+      lastActivityTime = now;
+      lastSentBatteryPercent = -1;
+      
+      // Send the first battery reading exactly 2 seconds (2000ms) after connecting
+      // so the Android phone can complete its BLE GATT Service Discovery
+      lastBatteryCheckTime = now - batteryCheckInterval + 2000; 
+    } else {
+      Serial.println();
+      Serial.println("BLE mouse disconnected");
+      buttonHeld1 = false;
+      debouncedButton1State = HIGH;
+      isScrolling = false;
+      remX = 0;
+      remY = 0;
+      scrollAccY = 0;
+      if (ledsEnabled) {
+        setAllPixelsBlue();
+      }
+    }
+    previousPaired = paired;
+  }
+
+  // ===================================================
+  // BATTERY MONITORING (16x Averaging + Force Notify)
+  // ===================================================
+  if (paired && (now - lastBatteryCheckTime >= batteryCheckInterval)) {
+    lastBatteryCheckTime = now;
+
+    // Take 16 samples and calculate average so the reading stays stable
+    long rawSum = 0;
+    for (int i = 0; i < 16; i++) {
+      rawSum += analogRead(BATT_PIN);
+    }
+    float rawAverage = rawSum / 16.0;
+    
+    float measuredVoltage = (rawAverage / 4095.0) * 3.3 * 2.0; 
+    float calibrationFactor = 3.98 / 3.04; 
+    float voltage = measuredVoltage * calibrationFactor;
+    
+    int batteryPercent = map((long)(voltage * 100), 330, 420, 0, 100);
+    batteryPercent = constrain(batteryPercent, 0, 100);
+
+    // Activate Low Battery Alert when 15% or lower
+    lowBattery = (batteryPercent <= lowBatteryThreshold);
+
+    // Android Force Notification Fix:
+    // If the value was the same last time or in setup(), change by 1% and send the actual value back
+    // so the BLE stack definitely sends a new Notification packet to Android
+    if (lastSentBatteryPercent == -1 || batteryPercent == 100) {
+      uint8_t tempVal = (batteryPercent > 1) ? (batteryPercent - 1) : 2;
+      mouse.setBatteryLevel(tempVal);
+      delay(15);
+    }
+    mouse.setBatteryLevel(batteryPercent);
+    lastSentBatteryPercent = batteryPercent;
+
+    Serial.print("Battery Voltage: ");
+    Serial.print(voltage, 2);
+    Serial.print("V | Percentage: ");
+    Serial.print(batteryPercent);
+    Serial.println(lowBattery ? "% [LOW BATTERY <= 15%]" : "%");
+  }
+
+  // Check buttons state (including active drag or scroll) to track user activity
+  bool buttonPressed = (digitalRead(BUTTON1_PIN) == LOW || 
+                        digitalRead(BUTTON2_PIN) == LOW || 
+                        digitalRead(BUTTON3_PIN) == LOW || 
+                        digitalRead(BUTTON4_PIN) == LOW ||
+                        buttonHeld1 || isScrolling);
+
+  if (buttonPressed) {
+    lastActivityTime = now;
+    if (isSleeping) {
+      isSleeping = false;
+      Serial.println("Woke up from Sleep Mode (Button Press)");
+      if (paired && ledsEnabled) {
+        setAllPixelsBlue();
+      }
+    }
+  }
+
+  // ===================================================
+  // AUTO-SLEEP CHECK (2 MINUTES INACTIVITY)
+  // ===================================================
+  if (!isSleeping && (now - lastActivityTime >= sleepTimeout)) {
+    isSleeping = true;
+    if (buttonHeld1 && paired) {
+      mouse.release(MouseButton::Left);
+      buttonHeld1 = false;
+      debouncedButton1State = HIGH;
+    }
+    isScrolling = false;
+    strip.clear();
+    strip.show();
+    Serial.println("Entering Power Saving / Sleep Mode (2 Mins Inactivity)");
+  }
+
+  // If in sleep mode, skip heavy tasks until motion or button wakes it up
+  if (isSleeping) {
+    float checkGyroX = -(mpu6050.getGyroZ() - gyroBiasZ);
+    float checkGyroY = -(mpu6050.getGyroY() - gyroBiasY);
+    
+    if (fabs(checkGyroX) > (deadzone * 3) || fabs(checkGyroY) > (deadzone * 3) || buttonPressed) {
+      isSleeping = false;
+      lastActivityTime = now;
+      Serial.println("Woke up from Sleep Mode (Motion Detected)");
+      if (paired && ledsEnabled) {
+        setAllPixelsBlue();
+      }
+    } else {
+      delay(50); 
+      return;
+    }
+  }
+
+  // ===================================================
+  // LED EFFECT (With 15% Low-Battery Red Alert Override)
+  // ===================================================
+  if (paired && ledsEnabled && !isSleeping) {
+    if (lowBattery) {
+      // Red light will blink every 500ms when battery is 15% or lower
+      if (now - lastLowBattBlinkTime >= 500) {
+        lastLowBattBlinkTime = now;
+        lowBattBlinkState = !lowBattBlinkState;
+        if (lowBattBlinkState) {
+          setAllPixelsColor(255, 0, 0); // Red Alert
+        } else {
+          strip.clear();
+          strip.show();
+        }
+      }
+    } else {
+      // Normal Rainbow Animation
+      if (now - lastRainbowTime >= rainbowInterval) {
+        lastRainbowTime = now;
+        for (int i = 0; i < NUM_LEDS; i++) {
+          int pixelHue = rainbowHue + (i * 65536L / NUM_LEDS);
+          strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(pixelHue)));
+        }
+        strip.show();
+        rainbowHue += 256;
+      }
+    }
+  }
+
+  // ===================================================
+  // BUTTON 1 PROCESSING (Debounced Left Click, Drag & Freeze)
+  // ===================================================
+  bool reading1 = digitalRead(BUTTON1_PIN);
+  if (reading1 != lastButton1Reading) {
+    lastDebounceTime1 = now;
+    if (reading1 == LOW && debouncedButton1State == HIGH && (now - clickFreezeTime > 150)) {
+      clickFreezeTime = now;
+    }
+  }
+  lastButton1Reading = reading1;
+
+  if ((now - lastDebounceTime1) >= debounceDelay) {
+    if (reading1 != debouncedButton1State) {
+      debouncedButton1State = reading1;
+      if (debouncedButton1State == LOW) {
+        buttonHeld1 = true;
+        if (paired) {
+          mouse.press(MouseButton::Left);
+          Serial.println("Left Button Pressed (Debounced)");
+        }
+      } else {
+        buttonHeld1 = false;
+        if (paired) {
+          mouse.release(MouseButton::Left);
+          Serial.println("Left Button Released (Debounced)");
+        }
+      }
+    }
+  }
+
+  // ===================================================
+  // BUTTON 2 PROCESSING (Right / Middle Click & Freeze)
+  // ===================================================
+  if (digitalRead(BUTTON2_PIN) == LOW) {
+    if (pressStart2 == 0) {
+      pressStart2 = now;
+      buttonHeld2 = false;
+      clickFreezeTime = now;
+    }
+    if (!buttonHeld2 && (now - pressStart2 >= longPressThreshold)) {
+      buttonHeld2 = true;
+      if (paired) {
+        mouse.click(MouseButton::Middle);
+        Serial.println("Middle Click");
+      }
+    }
+  } else {
+    if (pressStart2 != 0) {
+      unsigned long pressDuration = now - pressStart2;
+      if (!buttonHeld2 && pressDuration >= debounceDelay && pressDuration < clickThreshold && paired) {
+        mouse.click(MouseButton::Right, 20);
+        Serial.println("Right Click");
+      }
+      pressStart2 = 0;
+      buttonHeld2 = false;
+    }
+  }
+
+  // ===================================================
+  // BUTTON 3 PROCESSING (Turn ON LED)
+  // ===================================================
+  if (digitalRead(BUTTON3_PIN) == LOW) {
+    if (pressStart3 == 0) {
+      pressStart3 = now;
+      buttonHeld3 = false;
+    }
+    if (!buttonHeld3 && (now - pressStart3 >= debounceDelay)) {
+      buttonHeld3 = true;
+      ledsEnabled = true;
+      setAllPixelsBlue();
+      Serial.println("LED Turned ON");
+    }
+  } else {
+    pressStart3 = 0;
+    buttonHeld3 = false;
+  }
+
+  // ===================================================
+  // BUTTON 4 PROCESSING (Short Press: LED OFF | Long Press: Air Scroll)
+  // ===================================================
+  if (digitalRead(BUTTON4_PIN) == LOW) {
+    if (pressStart4 == 0) {
+      pressStart4 = now;
+      buttonHeld4 = false;
+    }
+    // Holding for 250ms or more will activate Gyro Air Scroll
+    if (!buttonHeld4 && (now - pressStart4 >= scrollHoldThreshold)) {
+      buttonHeld4 = true;
+      isScrolling = true;
+      scrollAccY = 0;
+      Serial.println("Air Scroll Mode: ACTIVE (Hold Button 4 & Tilt Up/Down)");
+    }
+  } else {
+    if (pressStart4 != 0) {
+      unsigned long pressDuration4 = now - pressStart4;
+      if (isScrolling) {
+        // If the user was scrolling, releasing the button will only turn off scroll mode (LED will not turn off)
+        isScrolling = false;
+        scrollAccY = 0;
+        fX = 0;
+        fY = 0;
+        remX = 0;
+        remY = 0;
+        Serial.println("Air Scroll Mode: OFF");
+      } else if (pressDuration4 >= debounceDelay && pressDuration4 < scrollHoldThreshold) {
+        // If the button is released before 250ms (Short Press), LED will turn OFF
+        ledsEnabled = false;
+        strip.clear();
+        strip.show();
+        Serial.println("LED Turned OFF (Short Press)");
+      }
+      pressStart4 = 0;
+      buttonHeld4 = false;
+    }
+  }
+
+  // Do not process gyro until paired
+  if (!paired) {
+    delay(5);
+    return;
+  }
+
+  // ===================================================
+  // GYRO MOUSE & AIR SCROLL PROCESSING
+  // ===================================================
+  if (now - lastMoveTime >= moveInterval) {
+    lastMoveTime = now;
+
+    float rawZ = mpu6050.getGyroZ();
+    float rawY = mpu6050.getGyroY();
+
+    // 1. BACKGROUND AUTO-CALIBRATION
+    if (fabs(rawZ - gyroBiasZ) < stillThreshold && fabs(rawY - gyroBiasY) < stillThreshold) {
+      if (stillStartTime == 0) {
+        stillStartTime = now;
+      } else if (now - stillStartTime >= autoCalibDelay) {
+        gyroBiasZ = (gyroBiasZ * 0.995) + (rawZ * 0.005);
+        gyroBiasY = (gyroBiasY * 0.995) + (rawY * 0.005);
+      }
+    } else {
+      stillStartTime = 0;
+    }
+
+    float gyroX = -(rawZ - gyroBiasZ);
+    float gyroY = -(rawY - gyroBiasY);
+
+    // 2. CLICK-SHAKE COMPENSATION (No need to freeze while scrolling)
+    if (!isScrolling && (now - clickFreezeTime < clickFreezeDuration)) {
+      fX = 0;
+      fY = 0;
+      remX = 0;
+      remY = 0;
+      return;
+    }
+
+    // Advanced Exponential Smoothing
+    fX = fX * smoothing + gyroX * (1.0 - smoothing);
+    fY = fY * smoothing + gyroY * (1.0 - smoothing);
+
+    // Apply Deadzone
+    float absX = fabs(fX);
+    float absY = fabs(fY);
+
+    if (absX < deadzone) absX = 0;
+    else absX -= deadzone;
+
+    if (absY < deadzone) absY = 0;
+    else absY -= deadzone;
+
+    // Non-linear Acceleration Curve (Sensitivity will be halved while Button 2 is held)
+    float currentSensitivity = (buttonHeld2 ? (baseSensitivity * 0.5) : baseSensitivity);
+
+    float moveX = (absX * absX * 0.0018 + absX * currentSensitivity) * (fX < 0 ? -1 : 1);
+    float moveY = (absY * absY * 0.0018 + absY * currentSensitivity) * (fY < 0 ? -1 : 1);
+
+    // 3. AIR SCROLL OR CURSOR MOVEMENT
+    if (isScrolling) {
+      // As long as Button 4 is pressed, moving hand up/down will scroll the page
+      if (absY > 0) {
+        scrollAccY += moveY * scrollSensitivity;
+      } else {
+        scrollAccY = 0;
+      }
+
+      int scrollStep = (int)scrollAccY;
+      if (scrollStep != 0) {
+        scrollAccY -= scrollStep;
+        lastActivityTime = now;
+        mouse.scroll(-scrollStep); // Tilting up scrolls up and tilting down scrolls down
+      }
+    } else {
+      // NORMAL CURSOR MOVEMENT (Sub-Pixel Accumulation)
+      if (absX > 0) remX += moveX;
+      else remX = 0;
+
+      if (absY > 0) remY += moveY;
+      else remY = 0;
+
+      int mouseX = (int)remX;
+      int mouseY = (int)remY;
+
+      remX -= mouseX;
+      remY -= mouseY;
+
+      if (mouseX != 0 || mouseY != 0) {
+        lastActivityTime = now;
+        mouse.move(mouseX, mouseY);
+      }
+    }
+  }
+}

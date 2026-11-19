@@ -17,4 +17,5 @@ Download the HijelHID_BLEMouse repository as a .zip file from GitHub.
 In Arduino IDE, go to Sketch → Include Library → Add .ZIP Library... and select the downloaded .zip file. (If prompted for dependencies during compile, also install NimBLE-Arduino from the Library Manager.)
 
 # Configure Board & Upload Settings
-BoardXIAO_ESP32C6Under Tools → Board → esp32PortSelect your active COM / USB portAppears when the board is plugged inUSB CDC On BootEnabledRequired to see gyro calibration & battery logs in Serial MonitorPartition SchemeHuge APP (3MB No OTA/1MB SPIFFS)Prevents "Sketch too big" errors caused by the BLE stackUpload Speed921600Standard fast flashing speed (drop to 115200 if uploads fail)
+BoardXIAO_ESP32C6Under 
+Tools → Board → esp32PortSelect your active COM / USB portAppears when the board is plugged inUSB CDC On BootEnabledRequired to see gyro calibration & battery logs in Serial MonitorPartition SchemeHuge APP (3MB No OTA/1MB SPIFFS)Prevents "Sketch too big" errors caused by the BLE stackUpload Speed921600Standard fast flashing speed (drop to 115200 if uploads fail)
